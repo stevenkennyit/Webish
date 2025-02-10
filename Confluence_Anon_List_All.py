@@ -3,45 +3,88 @@ import json
 import sys
 import getopt
 import os
+from tqdm import tqdm
+import urllib3
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def safe_request(url, headers):
+    """Handles API requests with error handling."""
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()  # Raises HTTPError for bad responses (4xx and 5xx)
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error: Request failed for {url} -> {e}")
+        return None
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON response from {url}")
+        return None
 
 def get_spaces(cURL, headers):
     """Retrieve all spaces in Confluence."""
     url = f"{cURL}/rest/api/space"
-    response = requests.get(url, headers=headers)
-    spaces = response.json().get("results", [])
-    return [space["key"] for space in spaces]
+    data = safe_request(url, headers)
+    if not data:
+        return []
+    return [(space["key"], f"{cURL}/spaces/viewspace.action?key={space['key']}") for space in data.get("results", [])]
+
+def get_child_pages(cURL, headers, parent_id):
+    """Recursively retrieve all child pages of a given page."""
+    url = f"{cURL}/rest/api/content/{parent_id}/child/page"
+    data = safe_request(url, headers)
+    if not data:
+        return []
+    
+    child_pages = [(page["id"], page["title"], f"{cURL}/pages/viewpage.action?pageId={page['id']}") for page in data.get("results", [])]
+    for page_id, page_title, page_url in tqdm(child_pages, desc=f"Retrieving child pages for {parent_id}"):
+        child_pages.extend(get_child_pages(cURL, headers, page_id))
+    
+    return child_pages
 
 def get_pages_in_space(cURL, headers, space_key):
-    """Retrieve all pages within a given space."""
+    """Retrieve all top-level pages within a given space."""
     url = f"{cURL}/rest/api/content?spaceKey={space_key}&expand=space,body.view,version"
-    response = requests.get(url, headers=headers)
-    pages = response.json().get("results", [])
-    return [(page["id"], page["title"]) for page in pages]
+    data = safe_request(url, headers)
+    if not data:
+        return []
+    return [(page["id"], page["title"], f"{cURL}/pages/viewpage.action?pageId={page['id']}") for page in data.get("results", [])]
 
 def get_attachments(cURL, headers, page_id):
     """Retrieve all attachments from a given page."""
     url = f"{cURL}/rest/api/content/{page_id}/child/attachment"
-    response = requests.get(url, headers=headers)
-    attachments = response.json().get("results", [])
-    return [(att["title"], att["_links"]["download"]) for att in attachments]
+    data = safe_request(url, headers)
+    if not data:
+        return []
+    return [(att["title"], f"{cURL}{att['_links']['download']}") for att in data.get("results", [])]
 
 def list_all_content(cURL, headers, output_file):
-    """List all spaces, pages, and attachments in Confluence and write to file."""
-    with open(output_file, "w") as f:
+    """List all spaces, pages (recursively), and attachments in Confluence and write to file."""
+    with open(output_file, "w", encoding="utf-8") as f:
         f.write("[*] Retrieving all spaces...\n")
         spaces = get_spaces(cURL, headers)
         
-        for space in spaces:
-            f.write(f"[*] Space: {space}\n")
+        for space, space_url in tqdm(spaces, desc="Processing spaces"):
+            f.write(f"[*] Space: {space} -> {space_url}\n")
             pages = get_pages_in_space(cURL, headers, space)
             
-            for page_id, page_title in pages:
-                f.write(f"    [Page] {page_title} (ID: {page_id})\n")
+            for page_id, page_title, page_url in tqdm(pages, desc=f"Retrieving pages in space {space}"):
+                f.write(f"    [Page] {page_title} (ID: {page_id}) -> {page_url}\n")
                 
+                # Recursively get child pages
+                child_pages = get_child_pages(cURL, headers, page_id)
+                for child_id, child_title, child_url in tqdm(child_pages, desc=f"Processing child pages of {page_title}"):
+                    f.write(f"        [Sub-Page] {child_title} (ID: {child_id}) -> {child_url}\n")
+                    
+                    attachments = get_attachments(cURL, headers, child_id)
+                    for att_name, att_url in tqdm(attachments, desc=f"Retrieving attachments for {child_title}"):
+                        f.write(f"            [Attachment] {att_name} -> {att_url}\n")
+                
+                # Get attachments for top-level pages as well
                 attachments = get_attachments(cURL, headers, page_id)
-                for att_name, att_url in attachments:
-                    full_url = f"{cURL}{att_url}"
-                    f.write(f"        [Attachment] {att_name} -> {full_url}\n")
+                for att_name, att_url in tqdm(attachments, desc=f"Retrieving attachments for {page_title}"):
+                    f.write(f"        [Attachment] {att_name} -> {att_url}\n")
 
 def main():
     cURL = ""
