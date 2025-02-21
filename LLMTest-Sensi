@@ -1,1 +1,4 @@
 john.bruer:totallyLLMtest123
+
+
+string connectionString = "Server=myServerAddress;Database=myDataBase;User Id=TestUser;Password=myPassword123;";
