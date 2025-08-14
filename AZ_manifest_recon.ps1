@@ -1,4 +1,4 @@
-﻿<# 
+<# 
   AZ_manifest.ps1 — Azure AD App Registration manifest scanner (PS 5.1 safe)
 
   Outputs:
@@ -9,12 +9,64 @@
     - Az.Accounts, Az.Resources
 #>
 
+
+
 [CmdletBinding()]
 param(
   [string]$DisplayNameLike
 )
 
 # ---------- Helpers ----------
+
+function Get-PublicClientStatus {
+  param($App)
+
+  $enabled = $false
+  $reasons = @()
+
+  # Case A: modern Graph flag
+  if ($App.PSObject.Properties.Name -contains 'IsFallbackPublicClient') {
+    if ($App.IsFallbackPublicClient -eq $true) {
+      $enabled = $true
+      $reasons += 'IsFallbackPublicClient:true'
+    }
+  }
+
+  # Case B: legacy Azure AD Graph boolean (some tenants/modules still surface this)
+  if ($App.PSObject.Properties.Name -contains 'PublicClient' -and ($App.PublicClient -is [bool])) {
+    if ($App.PublicClient) {
+      $enabled = $true
+      $reasons += 'PublicClient(bool):true'
+    }
+  }
+
+  # Case C: modern object form — only true if it has *actual URIs*
+  if ($App.PSObject.Properties.Name -contains 'PublicClient' -and ($App.PublicClient -and -not ($App.PublicClient -is [bool]))) {
+    $pc = $App.PublicClient
+    $uris = @()
+    if ($pc.PSObject.Properties.Name -contains 'RedirectUris') { $uris = @($pc.RedirectUris) }
+    elseif ($pc.PSObject.Properties.Name -contains 'redirectUris') { $uris = @($pc.redirectUris) }
+
+    if ($uris.Count -gt 0) {
+      $enabled = $true
+      $reasons += "PublicClient.RedirectUris:$($uris.Count)"
+    }
+  }
+
+  # Optional: heuristic — some tenants only use fallback but also stick localhost URIs elsewhere.
+  # Commented out by default.
+  # $allUris = @()
+  # if ($App.Web) { $allUris += @($App.Web.RedirectUris + $App.Web.redirectUris) }
+  # if ($App.Spa) { $allUris += @($App.Spa.RedirectUris + $App.Spa.redirectUris) }
+  # if ($allUris -match '^http://localhost|^http://127\.0\.0\.1|^urn:') { $enabled = $true; $reasons += 'Heuristic:localhost/urn' }
+
+  [pscustomobject]@{
+    Enabled = $enabled
+    Reason  = ($reasons -join '; ')
+  }
+}
+
+
 function Join-Short {
   param($Items, [int]$Max=6)
   if (-not $Items) { return "" }
@@ -203,9 +255,8 @@ $results = foreach ($app in $apps) {
   $spa = $app.Spa
 
   # Public client detection across Az/Graph variants
-  $publicClientEnabled = $false
-  if ($null -ne $app.PublicClient) { $publicClientEnabled = $true }
-  if ($app.PSObject.Properties.Name -contains 'IsFallbackPublicClient' -and $app.IsFallbackPublicClient) { $publicClientEnabled = $true }
+$pc = Get-PublicClientStatus $app
+$publicClientEnabled = [bool]$pc.Enabled
 
   # Implicit grant flags if present
   $implicitAccess = $false; $implicitId = $false
@@ -304,15 +355,45 @@ $results = foreach ($app in $apps) {
   }
 }
 
-# ---------- Output ----------
-$results | Sort-Object { [string]$_.'Findings' } -Descending |
-  Select-Object DisplayName, AppId, PublicClient, ImplicitAccessToken, ImplicitIdToken, HighRiskGraphPerms, HttpRedirects, WildcardRedirects, Findings |
-  Format-Table -AutoSize
-
+# ---------- Output (CSV is flattened; full manifests saved separately) ----------
+Write-Host "output time babes" -ForegroundColor Green
+# 1) FLATTENED CSV (no RawManifestJson, no multi-line fields)
 $csv = ".\aad_app_manifest_findings.csv"
+$flat = $results | Select-Object `
+  DisplayName,
+  AppId,
+  ObjectId,
+  SignInAudience,
+  PublicClient,
+  ImplicitAccessToken,
+  ImplicitIdToken,
+  HighRiskGraphPerms,
+  HttpRedirects,
+  WildcardRedirects,
+  IdentifierUris,
+  RedirectUris,
+  KnownClientApps,
+  OptionalClaims,
+  Permissions,
+  SecretsAndCertsMeta,
+  Findings
+
+$flat | Export-Csv -NoTypeInformation -Encoding UTF8 $csv
+
+<# 2) FULL MANIFESTS (one file per app, easy to grep/attach in evidence)
+$manDir = Join-Path (Get-Location) "aad_app_manifests"
+New-Item -ItemType Directory -Force -Path $manDir | Out-Null
+
+foreach ($r in $results) {
+  $safeName = ($r.DisplayName -replace '[\\/:*?"<>|]', '_')
+  $outPath  = Join-Path $manDir ("{0}__{1}.json" -f $safeName, $r.AppId)
+  $r.RawManifestJson | Out-File -Encoding UTF8 $outPath
+}#>
+
+# 3) SUMMARY JSON (no multi-line RawManifestJson string)
 $json = ".\aad_app_manifest_findings.json"
-$results | Export-Csv -NoTypeInformation -Encoding UTF8 $csv
-$results | ConvertTo-Json -Depth 6 | Out-File -Encoding UTF8 $json
+$flat | ConvertTo-Json -Depth 6 | Out-File -Encoding UTF8 $json
 
 Write-Host "`n[+] Wrote $csv and $json" -ForegroundColor Green
-Write-Host "[i] Tip: open the JSON for full manifest details, including RawManifestJson per app." -ForegroundColor DarkGray
+Write-Host "[+] Wrote per-app manifests to: $manDir" -ForegroundColor Green
+Write-Host "[i] Tip: Import-Csv $csv | measure should match app count." -ForegroundColor DarkGray
